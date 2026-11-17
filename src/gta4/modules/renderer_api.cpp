@@ -138,6 +138,8 @@ namespace gta4
 			std::uint32_t index_count = 0u;
 			std::uint32_t last_used_frame = 0u;
 			std::uint32_t bone_count = 0u;			// skinned mesh: bone transforms every instance has to carry
+			std::uint64_t bone_mask = 0u;			// skinned mesh: palette entries a vertex actually uses (weight > 0)
+			std::vector<float> bone_centers;		// skinned mesh: bind space center of each bone's vertices (3 per bone)
 			bool transient = false;					// a shape of one frame (flat tyre), destroyed once unused
 			bool uv_fallback = false;				// built from UV0 because the requested texcoord set was not usable
 			bool wound = false;						// ped wound overlay (the wounded triangles of a ped mesh, weight in the vertex alpha)
@@ -296,6 +298,8 @@ namespace gta4
 		std::vector<std::uint32_t> g_indices;
 		std::vector<float> g_blend_weights;          // 4 per vertex
 		std::vector<std::uint32_t> g_blend_indices;  // 4 per vertex
+		std::uint64_t g_last_bone_mask = 0u;		 // palette entries used by the last skinned build_vertices
+		float g_last_bone_min[renderer_api::MAX_BONES][3], g_last_bone_max[renderer_api::MAX_BONES][3]; // bind space bounds per bone
 
 		// -----
 		// dev tab switches
@@ -496,7 +500,7 @@ namespace gta4
 		/// a damaged vehicle draws its own variant of the shared undamaged mesh
 		std::uint64_t mesh_variant_hash(const std::uint64_t base, const renderer_api::draw_pose_s* pose)
 		{
-			if (!pose || (!pose->damage_hash && !pose->flat_hash)) {
+			if (!pose || (!pose->damage_hash && !pose->flat_hash && !pose->wheel_slot_hash)) {
 				return base;
 			}
 
@@ -505,7 +509,8 @@ namespace gta4
 
 			const auto h = base ^ (pose->damage_hash * 0xD6E8FEB86659FD93ull) 
 								^ (static_cast<std::uint64_t>(radius_bits) * 0xA0761D6478BD642Full)
-								^ (pose->flat_hash * 0x8EBC6AF09C88C6E3ull);
+								^ (pose->flat_hash * 0x8EBC6AF09C88C6E3ull)
+								^ (pose->wheel_slot_hash * 0x9E3779B97F4A7C15ull);
 
 			return h ? h : 1u;
 		}
@@ -1170,7 +1175,299 @@ namespace gta4
 				return pose.damage_hash != 0u;
 			}
 
-			/// tyres (gta_vehicle_tire, mostly drawn by RenderInstanced): the wheel matrix (matWheelTransform, rows) 
+			// -----
+			// wheel spin limiter
+			//
+			// At speed a wheel turns several radians between two rendered frames (e.g. ~275 deg at 30 fps / 100 km/h).
+			// The runtime derives motion vectors from last frame's and this frame's transform, a rotation of more than
+			// 180 deg per frame aliases into a different, smaller rotation (wagon wheel effect): the tyre gets motion
+			// vectors that have nothing to do with what is on screen and DLSS-RR / FG smear and flicker it.
+			// The spin around the axle that is shown is limited to wheel_spin_max_step per frame (direction kept),
+			// so motion vectors stay coherent. Below the limit the game's angle is used as is.
+
+			// tunables, re-read every 120 frames:
+			//  rtx_comp/wheel_spin_cap.txt : max shown spin in degrees per frame (default 8)
+			//  rtx_comp/wheel_freeze.txt   : present -> wheels don't spin at all (test switch)
+			float WHEEL_SPIN_MAX_STEP = 8.0f * 0.01745329f;
+			bool g_wheel_freeze = false;
+			std::uint32_t g_wheel_settings_frame = ~0u;
+
+			void refresh_wheel_settings()
+			{
+				if (g_wheel_settings_frame != ~0u && g_frame - g_wheel_settings_frame < 120u) {
+					return;
+				}
+
+				g_wheel_settings_frame = g_frame;
+				g_wheel_freeze = std::filesystem::exists("rtx_comp/wheel_freeze.txt");
+
+				float deg = 8.0f;
+				if (std::ifstream in("rtx_comp/wheel_spin_cap.txt"); in) {
+					in >> deg;
+				}
+
+				WHEEL_SPIN_MAX_STEP = std::clamp(deg, 0.5f, 90.0f) * 0.01745329f;
+			}
+			constexpr float WHEEL_MATCH_DIST_SQR = 4.0f * 4.0f; // a car moves < 2.5 m per frame even at high speed / low fps
+
+			struct wheel_spin_state_s
+			{
+				std::uint64_t slot = 0u;
+				float pos[3] = {};
+				float raw_angle = 0.0f;		// game's spin angle this frame
+				float shown_angle = 0.0f;	// angle we render
+				float dir = 0.0f;			// last known spin direction (+1 / -1)
+			};
+
+			std::vector<wheel_spin_state_s> g_wheels_prev, g_wheels_cur;
+			std::uint32_t g_wheels_frame = 0u;
+
+			// diagnostics (logged every 300 frames): which path tyres take and how fast they spin
+			struct wheel_diag_s
+			{
+				std::uint32_t tyre_calls = 0u, early_out = 0u, rejected_geom = 0u, rejected_target = 0u, skinned = 0u, rigid = 0u,
+							  flat = 0u, matched = 0u, unmatched = 0u, limited = 0u, owned = 0u, not_owned = 0u;
+				float max_step = 0.0f;
+			};
+			wheel_diag_s g_wheel_diag;
+
+			float wrap_pi(float a)
+			{
+				constexpr float PI = 3.14159265f, TAU = 6.28318531f;
+				a = std::fmod(a + PI, TAU);
+				if (a < 0.0f) {
+					a += TAU;
+				}
+				return a - PI;
+			}
+
+			void v3_normalize(float v[3], float& len)
+			{
+				len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+				if (len > 1e-8f) {
+					v[0] /= len; v[1] /= len; v[2] /= len;
+				}
+			}
+
+			void v3_cross(const float a[3], const float b[3], float o[3])
+			{
+				o[0] = a[1] * b[2] - a[2] * b[1];
+				o[1] = a[2] * b[0] - a[0] * b[2];
+				o[2] = a[0] * b[1] - a[1] * b[0];
+			}
+
+			float v3_dot(const float a[3], const float b[3]) {
+				return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+			}
+
+			/// rewrites the two non-axle axes of a wheel so the spin around the axle (ax0) advances at most
+			/// WHEEL_SPIN_MAX_STEP per frame. fwd is the vehicle's forward axis in the same space (spin reference),
+			/// world_pos identifies the wheel against last frame's wheels.
+			void limit_wheel_spin(const float ax0[3], float ax1[3], float ax2[3], const float fwd[3], const std::uint64_t slot, const float world_pos[3])
+			{
+				if (g_wheels_frame != g_frame)
+				{
+					refresh_wheel_settings();
+
+					// new frame: last frame's wheels become the reference
+					if (g_wheels_frame + 1u == g_frame) {
+						g_wheels_prev.swap(g_wheels_cur);
+					}
+					else {
+						g_wheels_prev.clear();
+					}
+
+					g_wheels_cur.clear();
+					g_wheels_frame = g_frame;
+				}
+
+				// basis without spin: axle (row 0), the vehicle's forward axis projected onto the wheel plane
+				float axle[3] = { ax0[0], ax0[1], ax0[2] }, len0, len1, len2;
+				float row1[3] = { ax1[0], ax1[1], ax1[2] };
+				float row2[3] = { ax2[0], ax2[1], ax2[2] };
+				v3_normalize(axle, len0);
+				v3_normalize(row1, len1);
+				v3_normalize(row2, len2);
+
+				if (len0 < 1e-6f || len1 < 1e-6f || len2 < 1e-6f) {
+					return;
+				}
+
+				float y0[3] = { fwd[0], fwd[1], fwd[2] };
+				const float d = v3_dot(y0, axle);
+				y0[0] -= axle[0] * d; y0[1] -= axle[1] * d; y0[2] -= axle[2] * d;
+				float ylen;
+				v3_normalize(y0, ylen);
+
+				if (ylen < 1e-3f) {
+					return; // axle along the vehicle's forward axis, not a wheel
+				}
+
+				float z0[3];
+				v3_cross(axle, y0, z0);
+
+				const float raw = std::atan2(v3_dot(row1, z0), v3_dot(row1, y0));
+
+				// mirrored wheels (left side) have a flipped third row
+				float c01[3];
+				v3_cross(axle, row1, c01);
+				const float handed = v3_dot(c01, row2) < 0.0f ? -1.0f : 1.0f;
+
+				wheel_spin_state_s s = {};
+				s.slot = slot;
+				s.pos[0] = world_pos[0]; s.pos[1] = world_pos[1]; s.pos[2] = world_pos[2];
+				s.raw_angle = raw;
+				s.shown_angle = raw;
+
+				// same wheel drawn again this frame (overlay pass): reuse what was decided
+				for (const auto& w : g_wheels_cur)
+				{
+					const float dx = w.pos[0] - world_pos[0], dy = w.pos[1] - world_pos[1], dz = w.pos[2] - world_pos[2];
+					if (w.slot == slot && dx * dx + dy * dy + dz * dz < 1e-4f && std::fabs(wrap_pi(w.raw_angle - raw)) < 1e-4f)
+					{
+						s = w;
+						goto apply;
+					}
+				}
+
+				{
+					const wheel_spin_state_s* prev = nullptr;
+					float best = WHEEL_MATCH_DIST_SQR;
+
+					for (const auto& w : g_wheels_prev)
+					{
+						if (w.slot != slot) {
+							continue;
+						}
+
+						const float dx = w.pos[0] - world_pos[0], dy = w.pos[1] - world_pos[1], dz = w.pos[2] - world_pos[2];
+						const float dist = dx * dx + dy * dy + dz * dz;
+
+						if (dist < best)
+						{
+							best = dist;
+							prev = &w;
+						}
+					}
+
+					if (!prev) {
+						g_wheel_diag.unmatched++;
+					}
+
+					if (prev)
+					{
+						const float step = wrap_pi(raw - prev->raw_angle);
+						g_wheel_diag.matched++;
+						g_wheel_diag.max_step = std::max(g_wheel_diag.max_step, std::fabs(step));
+						s.dir = prev->dir;
+
+						if (std::fabs(step) > 1e-4f && (std::fabs(step) < 1.5f || s.dir == 0.0f)) {
+							s.dir = step > 0.0f ? 1.0f : -1.0f; // unambiguous while the wheel is not too fast (a guess for cars first seen at speed)
+						}
+
+						if (std::fabs(step) > WHEEL_SPIN_MAX_STEP && s.dir != 0.0f) {
+							s.shown_angle = wrap_pi(prev->shown_angle + s.dir * WHEEL_SPIN_MAX_STEP);
+						}
+						else if (std::fabs(wrap_pi(raw - prev->shown_angle)) > WHEEL_SPIN_MAX_STEP && s.dir != 0.0f)
+						{
+							// slowing down: catch up with the game's angle without jumping
+							const float diff = wrap_pi(raw - prev->shown_angle);
+							s.shown_angle = wrap_pi(prev->shown_angle + (diff > 0.0f ? 1.0f : -1.0f) * WHEEL_SPIN_MAX_STEP);
+						}
+					}
+				}
+
+				g_wheels_cur.push_back(s);
+
+			apply:
+				if (g_wheel_freeze) {
+					s.shown_angle = 0.0f;
+				}
+
+				if (s.shown_angle == raw) {
+					return;
+				}
+
+				g_wheel_diag.limited++;
+
+				const float c = std::cos(s.shown_angle), sn = std::sin(s.shown_angle);
+				float n1[3] = { y0[0] * c + z0[0] * sn, y0[1] * c + z0[1] * sn, y0[2] * c + z0[2] * sn };
+				float n2[3];
+				v3_cross(axle, n1, n2);
+
+				for (auto i = 0; i < 3; i++)
+				{
+					ax1[i] = n1[i] * len1;
+					ax2[i] = n2[i] * len2 * handed;
+				}
+			}
+
+			/// vehicle space wheel matrix (rows = axes) of a rigid tyre
+			void limit_wheel_spin(float wheel[4][4], const std::uint64_t slot, const float world_pos[3])
+			{
+				static constexpr float FWD[3] = { 0.0f, 1.0f, 0.0f };
+				limit_wheel_spin(wheel[0], wheel[1], wheel[2], FWD, slot, world_pos);
+			}
+
+			// skinned tyres: the wheel spin is in the bones the tyre mesh uses. Set by try_draw_vehicle around the draw.
+			struct skinned_tyre_ctx_s
+			{
+				bool active = false;
+				float world[4][4] = {};	// vehicle world matrix (rows = axes, row 3 = origin)
+			};
+			skinned_tyre_ctx_s g_skinned_tyre;
+
+			/// bones: remixapi_Transform (rows = output xyz, columns 0-2 = bone axes, column 3 = offset from the vehicle
+			/// origin in world orientation). Only palette entries in bone_mask (used by the tyre mesh) are touched.
+			void limit_skinned_tyre_bones(remixapi_Transform* bones, const std::uint32_t bone_count, const std::uint64_t bone_mask, const std::vector<float>& centers)
+			{
+				if (centers.size() < static_cast<std::size_t>(bone_count) * 3u) {
+					return;
+				}
+
+				const auto& w = g_skinned_tyre.world;
+				float right[3] = { w[0][0], w[0][1], w[0][2] }, fwd[3] = { w[1][0], w[1][1], w[1][2] }, l;
+				v3_normalize(right, l);
+				v3_normalize(fwd, l);
+
+				for (auto b = 0u; b < bone_count && b < 64u; b++)
+				{
+					if (!(bone_mask & (1ull << b))) {
+						continue;
+					}
+
+					auto& m = bones[b].matrix;
+					float a0[3] = { m[0][0], m[1][0], m[2][0] };
+					float a1[3] = { m[0][1], m[1][1], m[2][1] };
+					float a2[3] = { m[0][2], m[1][2], m[2][2] };
+					// skinning matrices map bind space (vehicle model space) vertices, so the bone's translation is not the
+					// wheel center: rotate around the center of the bone's vertices (bind space c, currently at R c + t)
+					const float* cb = &centers[b * 3u];
+					float t[3];
+					for (auto r = 0; r < 3; r++) {
+						t[r] = m[r][0] * cb[0] + m[r][1] * cb[1] + m[r][2] * cb[2] + m[r][3];
+					}
+
+					// slot from the wheel center in vehicle space (own range so it never meets rigid tyre slots)
+					const float x = v3_dot(t, right), y = v3_dot(t, fwd);
+					const std::uint32_t side = x < -0.05f ? 0u : (x > 0.05f ? 2u : 1u);
+					const int axle = std::clamp(static_cast<int>(std::lround(y * 2.0f)), -60, 60) + 64;
+					const std::uint64_t slot = (1ull << 20u) + 1u + side + (static_cast<std::uint64_t>(axle) << 2u) + (static_cast<std::uint64_t>(b) << 10u);
+
+					const float world_pos[3] = { t[0] + w[3][0], t[1] + w[3][1], t[2] + w[3][2] };
+					limit_wheel_spin(a0, a1, a2, fwd, slot, world_pos);
+
+					// new rotation R' = [a0 a1 a2], keep the wheel center in place: t' = (R c + t) - R' c
+					for (auto r = 0; r < 3; r++)
+					{
+						m[r][1] = a1[r];
+						m[r][2] = a2[r];
+						m[r][3] = t[r] - (m[r][0] * cb[0] + m[r][1] * cb[1] + m[r][2] * cb[2]);
+					}
+				}
+			}
+
+			/// tyres (gta_vehicle_tire, mostly drawn by RenderInstanced): the wheel matrix (matWheelTransform, rows)
 			/// comes before the world matrix (c0 - c3)
 			bool read_tyre_pose(IDirect3DDevice9* dev, const drawcall_mod_context& ctx, renderer_api::draw_pose_s& pose)
 			{
@@ -1189,6 +1486,31 @@ namespace gta4
 				}
 
 				wheel[3][3] = 1.0f;
+
+				// wheel slot from its position in vehicle space (row 3): side (left / center for bikes / right) and
+				// axle (0.5 m steps along the vehicle). Constant per wheel, suspension and steering don't move it
+				{
+					const float x = wheel[3][0], y = wheel[3][1];
+					const std::uint32_t side = x < -0.05f ? 0u : (x > 0.05f ? 2u : 1u);
+					const int axle = std::clamp(static_cast<int>(std::lround(y * 2.0f)), -60, 60) + 64;
+					pose.wheel_slot_hash = 1u + side + (static_cast<std::uint64_t>(axle) << 2u);
+				}
+
+				// flat tyres are deformed with the game's wheel angle (tyre_constants), leave their spin alone
+				BOOL flat = FALSE;
+				if (ctx.info.vs_tyre_deform_register >= 0) {
+					dev->GetVertexShaderConstantB(static_cast<UINT>(ctx.info.vs_tyre_deform_register), &flat, 1);
+				}
+
+				if (!flat)
+				{
+					float world_pos[3];
+					for (auto c = 0; c < 3; c++) {
+						world_pos[c] = wheel[3][0] * world[0][c] + wheel[3][1] * world[1][c] + wheel[3][2] * world[2][c] + world[3][c];
+					}
+
+					limit_wheel_spin(wheel, pose.wheel_slot_hash, world_pos);
+				}
 
 				float m[4][4];
 				for (auto r = 0; r < 4; r++)
@@ -1665,6 +1987,16 @@ namespace gta4
 				}
 
 				std::uint32_t max_bone = 0u;
+				g_last_bone_mask = 0u;
+				for (auto b = 0u; b < renderer_api::MAX_BONES; b++)
+				{
+					for (auto c = 0; c < 3; c++)
+					{
+						g_last_bone_min[b][c] = FLT_MAX;
+						g_last_bone_max[b][c] = -FLT_MAX;
+					}
+				}
+
 				float v[4]; std::uint32_t n;
 
 				for (auto i = 0u; i < bytes.vertex_count; i++)
@@ -1738,6 +2070,16 @@ namespace gta4
 						{
 							if (w[k] > 0.0f) {
 								max_bone = std::max(max_bone, idx[k]);
+								if (idx[k] < 64u) { g_last_bone_mask |= 1ull << idx[k]; }
+
+								if (idx[k] < renderer_api::MAX_BONES)
+								{
+									for (auto c = 0; c < 3; c++)
+									{
+										g_last_bone_min[idx[k]][c] = std::min(g_last_bone_min[idx[k]][c], dst.position[c]);
+										g_last_bone_max[idx[k]][c] = std::max(g_last_bone_max[idx[k]][c], dst.position[c]);
+									}
+								}
 							} else {
 								idx[k] = idx[0]; // unused slots must still address a valid bone
 							}
@@ -2466,6 +2808,15 @@ namespace gta4
 
 				if (mesh_it->second.bone_count && !bones) {
 					return;
+				}
+
+				// skinned tyre: limit the spin of the wheel bones (see vehicles::limit_wheel_spin)
+				static remixapi_Transform s_tyre_bones[renderer_api::MAX_BONES];
+				if (bones && vehicles::g_skinned_tyre.active && mesh_it->second.bone_mask && mesh_it->second.bone_count <= renderer_api::MAX_BONES)
+				{
+					std::memcpy(s_tyre_bones, bones, sizeof(remixapi_Transform) * mesh_it->second.bone_count);
+					vehicles::limit_skinned_tyre_bones(s_tyre_bones, mesh_it->second.bone_count, mesh_it->second.bone_mask, mesh_it->second.bone_centers);
+					bones = s_tyre_bones;
 				}
 
 				submit_camera_once();
@@ -4256,8 +4607,10 @@ namespace gta4
 		PROFILE_ZONE();
 		static const auto gs = comp_settings::get();
 		const bool is_tyre = ctx.info.preset_index == GTA_VEHICLE_TIRE;
-		
+		if (is_tyre) { vehicles::g_wheel_diag.tyre_calls++; }
+
 		if (!is_enabled() || !gs->api_vehicles_enabled.get_as<bool>() || (!g_is_rendering_vehicle && !is_tyre) || (is_tyre && vehicles::g_debug_tyres_on_d3d9)) {
+			if (is_tyre) { vehicles::g_wheel_diag.early_out++; }
 			return false;
 		}
 
@@ -4291,6 +4644,7 @@ namespace gta4
 		const auto geom = current_geometry();
 		if (!geom || geom->second_vertex_buffer || geom->double_buffered)
 		{
+			if (is_tyre) { vehicles::g_wheel_diag.rejected_geom++; }
 			vehicles::count_vehicle_stat(vehicles::vehicle_stat::skips_rejected);
 			return false;
 		}
@@ -4304,11 +4658,13 @@ namespace gta4
 
 		if (!draws_to_primary_target(dev))
 		{
+			if (is_tyre) { vehicles::g_wheel_diag.rejected_target++; }
 			vehicles::count_vehicle_stat(vehicles::vehicle_stat::skips_target);
 			return false;
 		}
 
 		const bool rigid_tyre = is_tyre && !vertex_shader_is_skinned(dev);
+		if (is_tyre) { (rigid_tyre ? vehicles::g_wheel_diag.rigid : vehicles::g_wheel_diag.skinned)++; if (flat) { vehicles::g_wheel_diag.flat++; } }
 		bool pose_read = rigid_tyre ? vehicles::read_tyre_pose(dev, ctx, vehicles::g_vehicle_pose) : vehicles::read_vehicle_pose(dev, ctx, geom, vehicles::g_vehicle_pose);
 
 		if (pose_read && rigid_tyre && flat)
@@ -4332,17 +4688,24 @@ namespace gta4
 			ctx.info.remix_temp_float01 = 0.0f;
 		}
 
+		// skinned tyres carry the wheel spin in their bones, limited when the record is submitted
+		vehicles::g_skinned_tyre.active = is_tyre && !rigid_tyre && !flat && pose_read && vehicles::g_vehicle_pose.skinned
+			&& SUCCEEDED(dev->GetVertexShaderConstantF(0, &vehicles::g_skinned_tyre.world[0][0], 4));
+
 		const bool owned = pose_read && try_draw_impl(dev, ctx, type, prim_count, &vehicles::g_vehicle_pose, record_key);
+		vehicles::g_skinned_tyre.active = false;
 
 		ctx.modifiers.remix_modifier = draw_modifier;
 		ctx.info.remix_temp_float01 = draw_emissive_scale;
 
 		if (!owned)
 		{
+			if (is_tyre) { vehicles::g_wheel_diag.not_owned++; }
 			vehicles::count_vehicle_stat(vehicles::vehicle_stat::skips_rejected);
 			return false;
 		}
 
+		if (is_tyre) { vehicles::g_wheel_diag.owned++; }
 		vehicles::count_vehicle_stat(vehicles::g_vehicle_pose.flat_tyre ? vehicles::vehicle_stat::flat_tyres : is_tyre ? vehicles::vehicle_stat::tyres : vehicles::vehicle_stat::instances);
 		
 		if (vehicles::g_vehicle_pose.damage_hash) {
@@ -4795,6 +5158,17 @@ namespace gta4
 			mrec.transient = pose && pose->flat_tyre;
 			mrec.uv_fallback = uv_fallback;
 			mrec.bone_count = bone_count;
+			mrec.bone_mask = bone_count ? g_last_bone_mask : 0u;
+			if (bone_count)
+			{
+				mrec.bone_centers.resize(static_cast<std::size_t>(bone_count) * 3u);
+				for (auto b = 0u; b < bone_count && b < renderer_api::MAX_BONES; b++)
+				{
+					for (auto c = 0; c < 3; c++) {
+						mrec.bone_centers[b * 3u + c] = (mrec.bone_mask & (1ull << b)) ? 0.5f * (g_last_bone_min[b][c] + g_last_bone_max[b][c]) : 0.0f;
+					}
+				}
+			}
 			mrec.replacement_hash = replacement_hash;
 			mrec.vertex_count = static_cast<std::uint32_t>(g_vertices.size());
 			mrec.index_count = static_cast<std::uint32_t>(g_indices.size());
@@ -5017,6 +5391,14 @@ namespace gta4
 	{
 		PROFILE_ZONE();
 		g_frame++;
+
+		if (g_frame % 300u == 0u)
+		{
+			const auto& w = vehicles::g_wheel_diag;
+			shared::common::log("WheelDiag", std::format("300 frames: tyre calls {} | early out {} | rejected geom {} target {} | rigid {} skinned {} flat {} | matched {} unmatched {} limited {} | owned {} not owned (d3d9) {} | max step {:.2f} rad",
+				w.tyre_calls, w.early_out, w.rejected_geom, w.rejected_target, w.rigid, w.skinned, w.flat, w.matched, w.unmatched, w.limited, w.owned, w.not_owned, w.max_step));
+			vehicles::g_wheel_diag = {};
+		}
 		textures::process_texture_writes();
 		send_global_wetness();
 
