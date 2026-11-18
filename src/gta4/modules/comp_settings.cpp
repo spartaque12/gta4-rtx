@@ -189,6 +189,8 @@ namespace gta4
 				ASSIGN(api_vehicle_lights_enabled);
 				ASSIGN(api_vehicle_lights_emissive_scale);
 				ASSIGN(api_vehicle_lights_decal);
+				ASSIGN(api_vehicle_wheel_spin_limit);
+				ASSIGN(api_vehicle_wheel_spin_max_step);
 				ASSIGN(remix_override_rtxdi_samplecount);
 				ASSIGN(remix_var_queue_frame_timeout);
 				ASSIGN(unpin_main_thread);

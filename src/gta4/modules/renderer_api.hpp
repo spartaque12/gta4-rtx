@@ -83,6 +83,12 @@ namespace gta4
 			float tyre_constants[6][4] = {}; // matWheelTransform rows, tyreDeformParams, tyreDeformParams2
 			std::uint64_t flat_hash = 0u;
 
+			// rigid tyres: which wheel of the vehicle this is (side + axle from matWheelTransform). All wheels of a model
+			// share one mesh, and the runtime pairs an api instance with last frame's by mesh + nearest position, so at
+			// speed a wheel got paired with a neighbouring one (wrong / missing motion vectors -> DLSS/FG smearing,
+			// flicker). A mesh per wheel slot keeps every wheel paired with itself.
+			std::uint64_t wheel_slot_hash = 0u;
+
 			// ped wounds: the per bone damage the ped shaders blend their wound texture (sampler 1) with, in the bone palette
 			// space of the draw (the game's CustomBoneDamageArray)
 			struct wound_s

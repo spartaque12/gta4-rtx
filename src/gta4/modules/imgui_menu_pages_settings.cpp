@@ -872,6 +872,8 @@ namespace gta4::menu
 				{
 					compsettings_bool_widget("Vehicle Lights", gs->api_vehicle_lights_enabled);
 					compsettings_float_widget("Vehicle Lights Emissive Scale", gs->api_vehicle_lights_emissive_scale, 0.0f, 100.0f, 0.005f, "%.3f");
+					compsettings_bool_widget("Limit Wheel Spin", gs->api_vehicle_wheel_spin_limit);
+					compsettings_float_widget("Wheel Spin: Max Degrees per Frame", gs->api_vehicle_wheel_spin_max_step, 0.5f, 45.0f, 0.1f, "%.1f");
 					ImGui::EndDisabled();
 				}
 				ImGui::PopID();

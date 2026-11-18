@@ -659,6 +659,21 @@ namespace gta4
 				false
 			};
 
+			variable api_vehicle_wheel_spin_limit = {
+				"api_vehicle_wheel_spin_limit",
+				("Limit how far a wheel drawn through the Remix API turns per frame. At speed a wheel turns more than 180 degrees\n"
+				 "between frames, its motion vectors alias and DLSS-RR / FG smear the tyre."),
+				"1.8.1",
+				true
+			};
+
+			variable api_vehicle_wheel_spin_max_step = {
+				"api_vehicle_wheel_spin_max_step",
+				("Most a wheel turns per frame, in degrees, while 'api_vehicle_wheel_spin_limit' is on."),
+				"1.8.1",
+				4.0f
+			};
+
 			variable remix_override_rtxdi_samplecount = {
 				"remix_override_rtxdi_samplecount",
 				("Remix sets 'rtx.di.initialSampleCount' to hardcoded values on start.\n"
