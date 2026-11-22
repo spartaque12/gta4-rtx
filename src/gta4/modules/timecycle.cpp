@@ -166,37 +166,26 @@ namespace gta4
 				return;
 			}
 
-			if (const auto rain = shared::utils::mem::find_pattern("F3 0F 11 05 ? ? ? ? A3 ? ? ? ? A3 ? ? ? ? A3 ? ? ? ? F3 0F 11 0D", 4, "lens_fx: weather rain", true, 0u); rain) {
+			// patterns of the Complete Edition exe (the only one gta4-rtx supports)
+			if (const auto rain = shared::utils::mem::find_pattern("F3 0F 11 05 ? ? ? ? E8 ? ? ? ? 84 C0 74 15 E8 ? ? ? ? 84 C0", 4, "lens_fx: weather rain", true, 0u); rain) {
 				weather_rain = *reinterpret_cast<float**>(rain);
-			}
-			else if (const auto rain2 = shared::utils::mem::find_pattern("F3 0F 11 05 ? ? ? ? E8 ? ? ? ? 84 C0 74 15 E8 ? ? ? ? 84 C0", 4, "lens_fx: weather rain (alt)", true, 0u); rain2) {
-				weather_rain = *reinterpret_cast<float**>(rain2);
 			}
 
 			// the game only asks for raindrops on the camera while it looks up: ask regardless
-			if (const auto look_up = shared::utils::mem::find_pattern("76 15 B3 01", 0, "lens_fx: rain only looking up", true, 0u); look_up) {
-				shared::utils::hook::nop(look_up, 2);
-			}
-			else if (const auto look_up2 = shared::utils::mem::find_pattern("74 16 33 C0 80 7C 06", 0, "lens_fx: rain only looking up (alt)", true, 0u); look_up2)
+			if (const auto look_up = shared::utils::mem::find_pattern("74 16 33 C0 80 7C 06", 0, "lens_fx: rain only looking up", true, 0u); look_up)
 			{
-				shared::utils::hook::nop(look_up2 - 9u, 3);
-				shared::utils::hook::set(look_up2 - 9u, 0xB0, 0x01); // mov al, 1
+				shared::utils::hook::nop(look_up - 9u, 3);
+				shared::utils::hook::set(look_up - 9u, 0xB0, 0x01); // mov al, 1
 			}
 
 			// the camera, the way Fusion Rain Droplets reads it
-			if (const auto cam = shared::utils::mem::find_pattern("B9 ? ? ? ? E8 ? ? ? ? 84 C0 75 13 6A 01 6A 01 68 F4 01 00 00 B9 ? ? ? ? E8 ? ? ? ? 57", 1, "lens_fx: camera matrix", true, 0u); cam) {
+			if (const auto cam = shared::utils::mem::find_pattern("7A 21 B9", 3, "lens_fx: camera matrix", true, 0u); cam) {
 				camera_matrix = *reinterpret_cast<std::uint32_t*>(cam);
-			}
-			else if (const auto cam2 = shared::utils::mem::find_pattern("7A 21 B9", 3, "lens_fx: camera matrix (alt)", true, 0u); cam2) {
-				camera_matrix = *reinterpret_cast<std::uint32_t*>(cam2);
 			}
 
 			// the game's frame time
-			if (const auto ts = shared::utils::mem::find_pattern("D8 0D ? ? ? ? 83 C0 30", 0, "lens_fx: timestep", true, 0u); ts) {
-				timestep = *reinterpret_cast<float**>(ts - 9u);
-			}
-			else if (const auto ts2 = shared::utils::mem::find_pattern("F3 0F 10 05 ? ? ? ? 8B 02 51", 4, "lens_fx: timestep (alt)", true, 0u); ts2) {
-				timestep = *reinterpret_cast<float**>(ts2);
+			if (const auto ts = shared::utils::mem::find_pattern("F3 0F 10 05 ? ? ? ? 8B 02 51", 4, "lens_fx: timestep", true, 0u); ts) {
+				timestep = *reinterpret_cast<float**>(ts);
 			}
 
 			if (const auto start_effect = shared::utils::mem::find_pattern("56 8B F1 83 7E 10 00 8D 46 10 75 06 83 78 08 00 74 0A 56 50 8B 40 0C FF D0 83 C4 08", 0, "lens_fx: start effect", true, 0u); start_effect) {
